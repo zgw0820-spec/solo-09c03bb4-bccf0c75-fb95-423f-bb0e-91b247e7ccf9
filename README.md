@@ -23,6 +23,7 @@
 | 迟到旧传输不得回退 | `commit_version()` 拒绝任何 `serial <= active_serial` 的版本（返回 `ignored_stale`/False），事务保护 |
 | 任一方失败仍供原版 | 发布失败保留旧 active；同步失败保留旧 active；DNS 与 HTTP 在同一进程内独立运行 |
 | 主机发布无需等待备用 | 主机 API 不调用备用机；e2e 中备用停机时发布仍在毫秒级成功 |
+| 区域诊断接口 | `POST /api/diagnose`：最多 4 个区域内 A 域名，读取两机当前快照 + 直查两机 UDP，逐名给出结论（见下节） |
 | Docker Compose 双服务 + Swagger | `docker-compose.yml` 起 primary/backup；`http://<host>:8080/docs`、`http://<host>:8081/docs` |
 
 ### 数据模型（SQLite，WAL 模式）
@@ -51,6 +52,85 @@ state(key TEXT PRIMARY KEY, value TEXT)
 - `GET  /api/zone` 当前完整区域（含 serial、records、published_at）
 - `POST /api/zone` **仅主机**，请求体 `{"records":[{"name":"db.internal.local","ip":"10.0.0.11"}]}`，成功返回 201 与新 serial
 - `POST /api/sync` **仅备用机**，立即拉取一次，返回 `synced` / `ignored_stale` / `failed`
+- `POST /api/diagnose` 区域诊断（两机均可调用），见下节
+
+### 区域诊断 `POST /api/diagnose`
+
+请求体最多 4 个区域内 A 域名（大小写/末尾点会被规范化，重复、区域外、非 A
+名称一律 422）：
+
+```json
+{"names": ["db.internal.local", "web.internal.local"]}
+```
+
+一次诊断依次执行：
+
+1. 通过 REST API 读取**两机当前区域快照**（`GET /api/zone`，本机端口不可达时
+   退回本地存储并在 `snapshot.source` 标注 `local`）；
+2. 向两台 UDP DNS 各发一个 A 查询（并发送出、整体受 deadline 约束）；
+3. 再次读取两机快照，确认整段检查期间没有换版。
+
+逐名返回：`verdict`、说明 `detail`、两机的 `snapshot`（版本号、该名地址、
+是否可读）与 `udp`（是否应答、rcode、实际地址、超时原因）。响应顶层还有
+`versions_at_start` / `versions_at_end` 与 `retest_required`。
+
+判定优先级（每名只有一个结论）：
+
+| verdict | 含义 | 触发条件 |
+| --- | --- | --- |
+| `consistent` | 一致 | 两机同版本、快照相同，且各自 UDP 应答与快照一致 |
+| `backup_behind` | 备用落后 | 两机版本不同，备用序号更小（**不**跨版本比对 UDP 应答） |
+| `content_mismatch` | 同号内容不一致 | 两机序号相同但快照中该名地址不同 |
+| `node_answer_abnormal` | 节点应答异常 | 某机 UDP 应答与**它自己**的快照矛盾（地址或 rcode 不符），或版本对异常 |
+| `udp_no_response` | UDP 无响应 | 至少一台超时无应答；仍返回另一台已得到的结果 |
+| `retest_required` | 待复测 | 检查期间任一节点换版（start/end 序号不同或无法复核）：**不会**把不同版本的应答拼成故障 |
+| `diagnosis_incomplete` | 无法比对 | 某机快照读取失败，内容无法比较（非故障结论） |
+
+示例（compose 起来后，两机已同步同一版本）：
+
+```bash
+curl -sX POST http://localhost:8080/api/diagnose \
+  -H 'content-type: application/json' \
+  -d '{"names":["db.internal.local","web.internal.local"]}' | python -m json.tool
+```
+
+```json
+{
+  "zone": "internal.local",
+  "checked_at": "2026-11-16T00:00:00Z",
+  "versions_at_start": {"primary": 3, "backup": 3},
+  "versions_at_end":   {"primary": 3, "backup": 3},
+  "retest_required": false,
+  "names": [
+    {
+      "name": "db.internal.local",
+      "verdict": "consistent",
+      "detail": "serial=3 on both nodes, snapshot and UDP answer agree: 10.0.0.11",
+      "primary": {
+        "role": "primary", "api_base": "http://127.0.0.1:8000",
+        "snapshot": {"serial": 3, "published_at": "...", "found": true,
+                     "addresses": ["10.0.0.11"], "error": null,
+                     "available": true, "source": "api"},
+        "udp": {"responded": true, "rcode": "NOERROR",
+                "addresses": ["10.0.0.11"], "error": null}
+      },
+      "backup": {
+        "role": "backup", "api_base": "http://backup:8000",
+        "snapshot": {"serial": 3, "published_at": "...", "found": true,
+                     "addresses": ["10.0.0.11"], "error": null,
+                     "available": true, "source": "api"},
+        "udp": {"responded": true, "rcode": "NOERROR",
+                "addresses": ["10.0.0.11"], "error": null}
+      }
+    }
+  ]
+}
+```
+
+诊断不参与发布/同步：只在调用方请求内做只读快照与 UDP 查询，不持有发布或
+同步的锁，异步 I/O 期间事件循环可继续处理发布、后台同步与区域内 UDP 解析。
+单次 UDP 查询和整次诊断分别受 `DIAGNOSE_UDP_TIMEOUT` 与 `DIAGNOSE_DEADLINE`
+限制。
 
 DNS 行为：区域内 A 查询命中返回 NOERROR+A；区域内不存在的名称 NXDOMAIN；
 区域内非 A 查询（如 AAAA）返回 NOERROR NODATA；区域外查询 REFUSED。
@@ -70,6 +150,11 @@ curl -sX POST http://localhost:8080/api/zone -H 'content-type: application/json'
 
 # 手动同步（后台也会每 3 秒自动同步）
 curl -sX POST http://localhost:8081/api/sync
+
+# 区域诊断：核对两机快照与实际 UDP 应答
+curl -sX POST http://localhost:8080/api/diagnose \
+  -H 'content-type: application/json' \
+  -d '{"names":["db.internal.local","web.internal.local"]}'
 
 # UDP 查询
 dig @127.0.0.1 -p 5053 db.internal.local A
@@ -91,10 +176,16 @@ DNS_ROLE=backup  DB_PATH=./data/backup.db  DNS_PORT=15054 API_PORT=18001 \
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest tests/test_unit.py -q     # 校验/事务/防回退单元测试
+.venv/bin/python -m pytest tests/test_unit.py tests/test_diagnose_unit.py -q  # 单元（校验/事务/防回退/诊断判定）
 .venv/bin/python -I tests/e2e_test.py                # 双进程端到端 30 项
 .venv/bin/python -I tests/auto_sync_test.py          # 自动同步/幂等/Swagger 8 项
+.venv/bin/python -I tests/diagnose_test.py           # 区域诊断 41 项
 ```
+
+`tests/diagnose_test.py` 覆盖：两机一致的正常结论、请求校验（0/5 个、区域外、
+重复、大小写与末尾点）、备用机调用、Swagger/OpenAPI；随后用可控的假备用机
+分别制造备用落后、同号内容不一致、自相矛盾应答、UDP 静默、检查期间换版
+（必须 `retest_required` 而非故障）、慢上游期间发布/解析/同步不被阻塞。
 
 端到端覆盖：启动空版本 NXDOMAIN、非法发布不升序号、发布后 UDP 应答、
 手动与自动同步、黑洞上游期间旧版持续服务、恢复后自动追平、
@@ -112,6 +203,13 @@ DNS_ROLE=backup  DB_PATH=./data/backup.db  DNS_PORT=15054 API_PORT=18001 \
 | `SYNC_INTERVAL` | `5` | 备用机后台同步间隔秒 |
 | `HTTP_TIMEOUT` | `10` | 拉取区域 HTTP 超时秒 |
 | `MAX_RECORDS` | `8` | 单次区域最大 A 记录数 |
+| `BACKUP_API_URL` | 空 | **主机**访问备用机 API 的地址（诊断用；compose 已配 `http://backup:8000`） |
+| `SELF_API_URL` | 空 | 诊断读取本机快照的 API 地址；空则 `http://127.0.0.1:<API_PORT>` |
+| `PRIMARY_DNS_ADDR` | `primary:5053` | 诊断时直查的主机 UDP 地址 |
+| `BACKUP_DNS_ADDR` | `backup:5053` | 诊断时直查的备用 UDP 地址 |
+| `DIAGNOSE_UDP_TIMEOUT` | `2` | 单次 UDP 查询超时秒 |
+| `DIAGNOSE_UDP_ATTEMPTS` | `1` | 单次 UDP 查询重试次数 |
+| `DIAGNOSE_DEADLINE` | `6` | 整次诊断总预算秒 |
 
 ## 已知边界
 
@@ -119,3 +217,9 @@ DNS_ROLE=backup  DB_PATH=./data/backup.db  DNS_PORT=15054 API_PORT=18001 \
 - 传输为整份区域拉取（无增量/AXFR 分帧）；区域上限 8 条，单份报文很小。
 - 单机内嵌一个 UDP 解析线程与一个 uvicorn 进程；未做水平扩展与 TSIG 鉴权，
   内网部署时应限制 `/api/zone` 的调用来源。
+- 诊断是**诊断时的抽样**：它比较的是触发请求那一刻两机快照与 UDP 实际应答，
+  不追溯历史；若检查窗口内换版则明确给出 `retest_required` 而不下故障结论。
+  它也不判断终端侧缓存（TTL 30s）——终端仍解析到旧地址时，若两机当前一致，
+  说明旧答案来自更早的缓存/更早的版本，需在终端或中间解析器侧核查。
+- 诊断要求两机 API 互通（`BACKUP_API_URL` / `PRIMARY_API_URL`）；未配置时接口
+  返回 503 并说明缺哪个设置。

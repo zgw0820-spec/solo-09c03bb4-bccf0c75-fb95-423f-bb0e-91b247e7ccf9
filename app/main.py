@@ -7,8 +7,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 
 from .config import settings
+from .diagnose import diagnoser
 from .dns_server import dns_service
 from .models import (
+    DiagnosePayload,
+    DiagnoseResult,
     PublishResult,
     RecordOut,
     VersionOut,
@@ -77,11 +80,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Primary/Backup DNS for fixed intranet zone",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Primary accepts a complete zone (up to 8 A records); the backup "
         "pulls whole versions over HTTP and answers A queries over UDP. "
-        "Every answer uses one immutable version."
+        "Every answer uses one immutable version.\n\n"
+        "**Zone diagnosis** (`POST /api/diagnose`): submit up to four "
+        "in-zone A names. The endpoint reads both nodes' current zone "
+        "snapshots through their REST APIs and queries both UDP listeners, "
+        "then returns per name the version on each node, the snapshot "
+        "addresses, the actual UDP answer and one verdict: `consistent`, "
+        "`backup_behind`, `content_mismatch`, `node_answer_abnormal`, "
+        "`udp_no_response`, `retest_required` (a version changed while "
+        "checking) or `diagnosis_incomplete` (a snapshot was unreadable). "
+        "A timeout on one node still returns the other node's answer."
     ),
     lifespan=lifespan,
 )
@@ -100,6 +112,42 @@ def get_version() -> VersionOut:
 @app.get("/api/zone", response_model=ZoneOut, tags=["zone"])
 def get_zone() -> ZoneOut:
     return _zone_out()
+
+
+@app.post(
+    "/api/diagnose",
+    response_model=DiagnoseResult,
+    tags=["diagnosis"],
+)
+async def diagnose(payload: DiagnosePayload) -> DiagnoseResult:
+    """Compare both nodes for up to four in-zone A names.
+
+    Reads each node's current zone snapshot from its REST API and queries
+    both UDP DNS listeners. Returns, per name, the version on each node,
+    the snapshot addresses, the actual UDP answer and a verdict. Version
+    changes during the check yield ``retest_required``; a UDP timeout on
+    one node still returns the other node's result.
+
+    Example request:
+
+    ```json
+    {"names": ["db.internal.local", "web.internal.local"]}
+    ```
+    """
+    if not settings.peer_api_url():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "the peer node's API URL is not configured; "
+                + (
+                    "set BACKUP_API_URL on the primary"
+                    if settings.is_primary
+                    else "set PRIMARY_API_URL on the backup"
+                )
+                + " so both snapshots can be compared"
+            ),
+        )
+    return await diagnoser.run(payload.names)
 
 
 # ---------------------------------------------------------------- primary

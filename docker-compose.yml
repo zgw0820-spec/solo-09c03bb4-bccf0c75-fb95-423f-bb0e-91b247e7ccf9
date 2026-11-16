@@ -8,6 +8,12 @@ services:
       DB_PATH: /data/primary.db
       DNS_PORT: "5053"
       API_PORT: "8000"
+      # Zone diagnosis: where each node's API and UDP listener live.
+      BACKUP_API_URL: http://backup:8000
+      PRIMARY_DNS_ADDR: primary:5053
+      BACKUP_DNS_ADDR: backup:5053
+      DIAGNOSE_UDP_TIMEOUT: "2"
+      DIAGNOSE_DEADLINE: "6"
     ports:
       - "8080:8000"      # primary Swagger / REST
       - "5053:5053/udp"  # primary DNS
@@ -34,6 +40,11 @@ services:
       PRIMARY_API_URL: http://primary:8000
       SYNC_INTERVAL: "3"
       HTTP_TIMEOUT: "10"
+      # Zone diagnosis: the backup already knows PRIMARY_API_URL.
+      PRIMARY_DNS_ADDR: primary:5053
+      BACKUP_DNS_ADDR: backup:5053
+      DIAGNOSE_UDP_TIMEOUT: "2"
+      DIAGNOSE_DEADLINE: "6"
     ports:
       - "8081:8000"      # backup Swagger / REST
       - "5054:5053/udp"  # backup DNS

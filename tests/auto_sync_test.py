@@ -109,7 +109,8 @@ def main():
         spec = httpx.get(f"{PRIMARY_API}/openapi.json", timeout=3).json()
         paths = sorted(spec["paths"].keys())
         check("openapi documents all endpoints",
-              paths == ["/api/sync", "/api/version", "/api/zone", "/health"],
+              paths == ["/api/diagnose", "/api/sync", "/api/version",
+                        "/api/zone", "/health"],
               str(paths))
         ui = httpx.get(f"{PRIMARY_API}/docs", timeout=3)
         check("Swagger UI reachable", ui.status_code == 200)
